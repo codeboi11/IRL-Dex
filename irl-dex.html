@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Pet Spotter">
+<meta name="theme-color" content="#14201a">
+<title>Pet Spotter</title>
+<style>
+  :root {
+    --ink: #14201a;
+    --paper: #f3efe4;
+    --cat: #ffb703;
+    --dog: #4cc9f0;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; background: var(--ink); color: var(--paper);
+    font-family: ui-rounded, "SF Pro Rounded", -apple-system, system-ui, sans-serif;
+    overflow: hidden; -webkit-user-select: none; user-select: none; }
+  #stage { position: fixed; inset: 0; }
+  video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  #status {
+    position: fixed; left: 0; right: 0; top: 0;
+    padding: calc(env(safe-area-inset-top, 0px) + 12px) 16px 12px;
+    background: linear-gradient(rgba(20,32,26,.85), rgba(20,32,26,0));
+    font-size: 15px; display: flex; gap: 10px; align-items: center; pointer-events: none;
+  }
+  #dot { width: 10px; height: 10px; border-radius: 50%; background: #888; flex: none; }
+  #dot.live { background: #6be675; }
+  #bar {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    padding: 14px 16px calc(env(safe-area-inset-bottom, 0px) + 16px);
+    display: flex; justify-content: center; gap: 12px;
+    background: linear-gradient(rgba(20,32,26,0), rgba(20,32,26,.85));
+  }
+  button {
+    font: inherit; font-weight: 600; font-size: 16px; color: var(--ink);
+    background: var(--paper); border: 0; border-radius: 999px; padding: 14px 24px;
+  }
+  button:active { transform: scale(.97); }
+  button:focus-visible { outline: 3px solid var(--cat); outline-offset: 2px; }
+  #splash {
+    position: fixed; inset: 0; z-index: 5; display: flex; flex-direction: column;
+    justify-content: center; padding: 32px; gap: 16px; background: var(--ink);
+  }
+  #splash h1 { font-size: 40px; line-height: 1.05; }
+  #splash p { font-size: 17px; line-height: 1.45; max-width: 34ch; opacity: .85; }
+  #splash button { align-self: flex-start; margin-top: 8px; background: var(--cat); }
+  #err { color: #ff9b8a; font-size: 15px; line-height: 1.4; max-width: 36ch; }
+  #cards { position: fixed; left: 12px; right: 12px; bottom: calc(env(safe-area-inset-bottom, 0px) + 84px);
+    display: flex; flex-direction: column; gap: 10px; max-width: 480px; margin: 0 auto; z-index: 3; }
+  .card { background: #1d2c24; border-radius: 14px; padding: 14px 16px; border-left: 6px solid var(--c);
+    box-shadow: 0 8px 28px rgba(0,0,0,.5); }
+  .card-top { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+  .card h2 { font-size: 19px; margin-right: auto; }
+  .conf { font-size: 13px; opacity: .8; }
+  .x { background: transparent; color: var(--paper); font-size: 22px; line-height: 1; padding: 2px 10px; }
+  .card img { float: right; width: 72px; height: 72px; object-fit: cover; border-radius: 8px; margin: 0 0 6px 10px; }
+  .card p { font-size: 15px; line-height: 1.45; }
+  .card a { color: var(--c); font-size: 13px; display: inline-block; margin-top: 6px; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="splash">
+  <h1>Point at a cat or a dog.</h1>
+  <p>Pet Spotter finds them in your camera view, draws a box, and names them. Everything runs on your phone; no video leaves it.</p>
+  <button id="start">Start camera</button>
+  <div id="err" role="alert"></div>
+</div>
+
+<div id="stage" class="hidden">
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="overlay"></canvas>
+</div>
+<div id="status" class="hidden"><span id="dot"></span><span id="msg">Loading model…</span></div>
+<div id="cards" aria-live="polite"></div>
+<div id="bar" class="hidden"><button id="flip">Flip camera</button></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+const WANTED = { cat: { label: "Cat", color: "#ffb703", wiki: "Cat" }, dog: { label: "Dog", color: "#4cc9f0", wiki: "Dog" } };
+const MIN_SCORE = 0.5;
+const FORGET_MS = 3000;
+
+const $ = id => document.getElementById(id);
+const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
+let model, stream, facing = "environment", running = false;
+
+function setMsg(text, live) { $("msg").textContent = text; $("dot").classList.toggle("live", !!live); }
+
+async function startCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: false,
+    video: { facingMode: { ideal: facing }, width: { ideal: 1280 }, height: { ideal: 720 } }
+  });
+  video.srcObject = stream;
+  await video.play();
+}
+
+// Map a box from video pixels to screen pixels, matching object-fit: cover.
+function mapper() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const cw = canvas.clientWidth, ch = canvas.clientHeight;
+  const s = Math.max(cw / vw, ch / vh);
+  const ox = (cw - vw * s) / 2, oy = (ch - vh * s) / 2;
+  return { s, ox, oy };
+}
+
+function draw(preds) {
+  const dpr = window.devicePixelRatio || 1;
+  const cw = canvas.clientWidth, ch = canvas.clientHeight;
+  if (canvas.width !== cw * dpr || canvas.height !== ch * dpr) {
+    canvas.width = cw * dpr; canvas.height = ch * dpr;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cw, ch);
+  const { s, ox, oy } = mapper();
+
+  for (const p of preds) {
+    const info = WANTED[p.class];
+    if (!info || p.score <= MIN_SCORE) continue;
+    const [bx, by, bw, bh] = p.bbox;
+    const x = bx * s + ox, y = by * s + oy, w = bw * s, h = bh * s;
+
+    ctx.lineWidth = 4; ctx.strokeStyle = info.color; ctx.lineJoin = "round";
+    ctx.strokeRect(x, y, w, h);
+
+    const text = `${info.label} ${Math.round(p.score * 100)}%`;
+    ctx.font = "700 18px ui-rounded, -apple-system, system-ui, sans-serif";
+    const tw = ctx.measureText(text).width + 20, th = 30;
+    const ly = y - th >= 0 ? y - th : y;           // keep the label on screen
+    ctx.fillStyle = info.color;
+    ctx.fillRect(x - 2, ly, tw, th);
+    ctx.fillStyle = "#14201a";
+    ctx.textBaseline = "middle";
+    ctx.fillText(text, x + 8, ly + th / 2 + 1);
+  }
+}
+
+// ---- Wikipedia pop-up ----
+const seen = {}, wikiCache = new Map();
+function shorten(t, max = 320) {
+  const parts = t.match(/[^.!?]+[.!?]+(\s|$)/g) || [t];
+  let out = "";
+  for (const x of parts) { if ((out + x).length > max && out) break; out += x; if (out.length >= 160) break; }
+  return out.trim();
+}
+async function getWiki(title) {
+  if (wikiCache.has(title)) return wikiCache.get(title);
+  const r = await fetch("https://en.wikipedia.org/api/rest_v1/page/summary/" + encodeURIComponent(title));
+  if (!r.ok) throw new Error("wiki " + r.status);
+  const j = await r.json();
+  const d = { text: shorten(j.extract || ""), url: j.content_urls && j.content_urls.mobile && j.content_urls.mobile.page, img: j.thumbnail && j.thumbnail.source };
+  wikiCache.set(title, d); return d;
+}
+function closeCard(cls) {
+  const st = seen[cls]; if (!st) return;
+  if (st.card) { st.card.remove(); st.card = null; }
+  st.dismissed = true;
+}
+async function openCard(cls, score) {
+  const info = WANTED[cls], st = seen[cls];
+  const card = document.createElement("section");
+  card.className = "card"; card.style.setProperty("--c", info.color);
+  const top = document.createElement("div"); top.className = "card-top";
+  const h = document.createElement("h2"); h.textContent = info.label;
+  const conf = document.createElement("span"); conf.className = "conf"; conf.textContent = Math.round(score * 100) + "% sure";
+  const x = document.createElement("button"); x.className = "x"; x.textContent = "\u00d7";
+  x.setAttribute("aria-label", "Close " + info.label + " entry"); x.onclick = () => closeCard(cls);
+  top.append(h, conf, x);
+  const p = document.createElement("p"); p.textContent = "Loading Wikipedia entry\u2026";
+  card.append(top, p);
+  $("cards").appendChild(card); st.card = card;
+  try {
+    const w = await getWiki(info.wiki);
+    if (w.img) { const im = document.createElement("img"); im.src = w.img; im.alt = info.label; card.insertBefore(im, p); }
+    p.textContent = w.text || "No description available.";
+    if (w.url) { const a = document.createElement("a"); a.href = w.url; a.target = "_blank"; a.rel = "noopener"; a.textContent = "Read more on Wikipedia"; card.appendChild(a); }
+  } catch (e) { p.textContent = "Could not load the Wikipedia entry. Check your connection."; }
+}
+function updateCards(preds) {
+  const now = performance.now(), best = {};
+  for (const p of preds) if (WANTED[p.class] && p.score > MIN_SCORE && (!best[p.class] || p.score > best[p.class])) best[p.class] = p.score;
+  for (const cls of Object.keys(WANTED)) {
+    const st = seen[cls] || (seen[cls] = { lastSeen: 0, dismissed: false, card: null });
+    if (best[cls]) { st.lastSeen = now; if (!st.card && !st.dismissed) openCard(cls, best[cls]); }
+    else if (now - st.lastSeen > FORGET_MS) st.dismissed = false;
+  }
+}
+
+async function loop() {
+  if (!running) return;
+  if (video.readyState >= 2 && video.videoWidth) {
+    const preds = await model.detect(video, 10, 0.4);
+    draw(preds);
+    updateCards(preds);
+    const found = preds.filter(p => WANTED[p.class] && p.score > MIN_SCORE);
+    setMsg(found.length ? found.map(p => WANTED[p.class].label).join(", ") + " found" : "Looking for a cat or dog…", true);
+  }
+  requestAnimationFrame(loop);
+}
+
+$("start").addEventListener("click", async () => {
+  $("err").textContent = "";
+  $("start").disabled = true;
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error("Camera access needs a secure (https) page. Host this file on an https site and open it in Safari.");
+    }
+    await startCamera();
+    $("splash").classList.add("hidden");
+    ["stage", "status", "bar"].forEach(id => $(id).classList.remove("hidden"));
+    setMsg("Loading model…");
+    model = await cocoSsd.load({ base: "lite_mobilenet_v2" });
+    running = true;
+    loop();
+  } catch (e) {
+    $("start").disabled = false;
+    $("splash").classList.remove("hidden");
+    $("err").textContent = e.name === "NotAllowedError"
+      ? "Camera permission was denied. Allow it in Settings > Safari > Camera, then try again."
+      : (e.message || "Could not start the camera.");
+  }
+});
+
+$("flip").addEventListener("click", async () => {
+  facing = facing === "environment" ? "user" : "environment";
+  try { await startCamera(); } catch (e) { setMsg("Could not switch camera"); }
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (!model) return;
+  running = !document.hidden;
+  if (running) loop();
+});
+</script>
+</body>
+</html>
